@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use futures::future::join_all;
 use futures::Future;
 use rand::{thread_rng, Rng, RngCore};
+use redis::aio::{ConnectionManager, MultiplexedConnection};
 use redis::Value::Okay;
 use redis::{Client, IntoConnectionInfo, RedisResult, Value};
 
@@ -68,11 +69,21 @@ pub struct LockManager {
     retry_delay: Duration,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct LockManagerInner {
     /// List of all Redis clients
     pub servers: Vec<Client>,
+    pub connections: Arc<std::sync::RwLock<Vec<ConnectionManager>>>,
     quorum: u32,
+}
+
+impl std::fmt::Debug for LockManagerInner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LockManagerInner")
+            .field("servers", &self.servers)
+            .field("quorum", &self.quorum)
+            .finish()
+    }
 }
 
 /// A distributed lock that can be acquired and released across multiple Redis instances.
@@ -139,11 +150,41 @@ impl LockManager {
         LockManager {
             lock_manager_inner: Arc::new(LockManagerInner {
                 servers: clients,
+                connections: Arc::new(std::sync::RwLock::new(Vec::new())),
                 quorum,
             }),
             retry_count: DEFAULT_RETRY_COUNT,
             retry_delay: DEFAULT_RETRY_DELAY,
         }
+    }
+
+    pub async fn get_connections(&self) -> RedisResult<Vec<ConnectionManager>> {
+        {
+            let connections = self.lock_manager_inner.connections.read().unwrap();
+            if connections.len() == self.lock_manager_inner.servers.len() {
+                return Ok(connections.clone());
+            }
+        }
+
+        let new = join_all(
+            self.lock_manager_inner
+                .servers
+                .iter()
+                .map(|client| client.get_connection_manager()),
+        )
+        .await
+        .into_iter()
+        .collect::<RedisResult<Vec<_>>>()?;
+
+        {
+            let mut connections = self.lock_manager_inner.connections.write().unwrap();
+
+            // If someone else concurrently updated the connections, we don't need to update them again
+            if connections.len() != self.lock_manager_inner.servers.len() {
+                *connections = new.clone();
+            }
+        }
+        Ok(new)
     }
 
     /// Get 20 random bytes from the pseudorandom interface.
